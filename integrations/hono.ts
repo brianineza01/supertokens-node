@@ -1,25 +1,27 @@
 /**
- * Standalone SuperTokens + Hono integration (not part of the built-in framework adapters).
+ * Standalone SuperTokens + Hono integration (outside the built-in framework adapters).
  *
- * Usage:
- *   import supertokens from "supertokens-node";
- *   import { Hono } from "hono";
- *   import { superTokensMiddleware, verifySession } from "./integrations/hono";
+ * Express equivalent:
+ *   app.use(middleware());          // handles /auth/signup, /auth/signin, /auth/session/refresh, etc.
+ *   app.get("/api", verifySession(), handler);
+ *   app.onError(errorHandler());
  *
- *   supertokens.init({ framework: "custom", /* ... */ });
+ * Hono equivalent:
+ *   app.use("*", middleware());
+ *   app.get("/api", verifySession(), handler);
+ *   app.onError(errorHandler());
  *
- *   const app = new Hono();
- *   app.use("*", superTokensMiddleware());
- *   app.get("/api", verifySession(), (c) => c.json({ userId: c.req.session!.getUserId() }));
+ * Requires: supertokens.init({ framework: "custom", ... })
  */
 
-import type { Context, MiddlewareHandler, Next } from "hono";
+import type { Context, ErrorHandler, MiddlewareHandler, Next } from "hono";
 import { getCookie } from "hono/cookie";
 import { serialize } from "cookie";
 import {
     CollectingResponse,
     PreParsedRequest,
     middleware as supertokensCustomMiddleware,
+    errorHandler as supertokensCustomErrorHandler,
 } from "supertokens-node/framework/custom";
 import { verifySession as customVerifySession } from "supertokens-node/recipe/session/framework/custom";
 import type { VerifySessionOptions, SessionContainer } from "supertokens-node/recipe/session";
@@ -70,19 +72,30 @@ function mergeCollectingResponseIntoHonoResponse(
     return honoResponse;
 }
 
+function getRequestUrl(c: Context): string {
+    // Hono exposes the full URL; SuperTokens normalises this to the pathname internally.
+    // Include the query string so behaviour matches Express' originalUrl.
+    const url = new URL(c.req.url);
+    return url.pathname + url.search;
+}
+
 /**
  * Wraps a Hono context into SuperTokens' custom-framework request type.
  */
 export function wrapHonoRequest(c: Context): PreParsedRequest {
     return new PreParsedRequest({
         method: c.req.method as HTTPMethod,
-        url: c.req.url,
-        query: Object.fromEntries(new URL(c.req.url).searchParams.entries()),
+        url: getRequestUrl(c),
+        query: c.req.query(),
         cookies: getCookie(c),
         headers: c.req.raw.headers,
-        getFormBody: () => c.req.formData(),
+        getFormBody: () => c.req.parseBody(),
         getJSONBody: () => c.req.json(),
     });
+}
+
+export function wrapHonoResponse(): CollectingResponse {
+    return new CollectingResponse();
 }
 
 function getStoredRequest(c: Context): PreParsedRequest {
@@ -93,16 +106,22 @@ function getStoredCollectingResponse(c: Context): CollectingResponse {
     return c.get(ST_RESPONSE_KEY) ?? new CollectingResponse();
 }
 
+function storeContext(c: Context, request: PreParsedRequest, response: CollectingResponse): void {
+    c.set(ST_REQUEST_KEY, request);
+    c.set(ST_RESPONSE_KEY, response);
+}
+
 /**
- * Hono middleware that runs SuperTokens API routes and attaches an optional session to the request.
+ * Handles all SuperTokens API routes (e.g. /auth/signup, /auth/signin, /auth/signout,
+ * /auth/session/refresh). Non-auth routes pass through to the next handler.
+ *
+ * This is the direct Hono equivalent of `supertokens-node/framework/express` `middleware()`.
  */
-export function superTokensMiddleware(): MiddlewareHandler {
+export function middleware(): MiddlewareHandler {
     return async (c: Context, next: Next) => {
         const request = wrapHonoRequest(c);
         const collectingResponse = new CollectingResponse();
-
-        c.set(ST_REQUEST_KEY, request);
-        c.set(ST_RESPONSE_KEY, collectingResponse);
+        storeContext(c, request, collectingResponse);
 
         const stMiddleware = supertokensCustomMiddleware(() => request);
         const { handled, error } = await stMiddleware(request, collectingResponse);
@@ -112,17 +131,49 @@ export function superTokensMiddleware(): MiddlewareHandler {
         }
 
         if (handled) {
+            // SuperTokens handled an auth/API route — return immediately, do not call next().
             return toWebResponse(collectingResponse);
         }
+
+        return next();
+    };
+}
+
+/**
+ * Global error handler for session-related SuperTokens errors.
+ * Register with `app.onError(errorHandler())` — place after your routes.
+ *
+ * Equivalent to `app.use(errorHandler())` in Express.
+ */
+export function errorHandler(): ErrorHandler {
+    const stErrorHandler = supertokensCustomErrorHandler();
+
+    return async (err: Error, c: Context) => {
+        const request = getStoredRequest(c);
+        const collectingResponse = getStoredCollectingResponse(c);
+
+        await stErrorHandler(err, request, collectingResponse, () => {
+            throw err;
+        });
+
+        return toWebResponse(collectingResponse);
+    };
+}
+
+/**
+ * Optional helper: attaches a session to `c.req.session` on every request without requiring it.
+ * Use this if you want session available on all routes (similar to the Cloudflare Workers example).
+ * Not required if you only use `verifySession()` on protected routes (Express-style).
+ */
+export function attachSession(): MiddlewareHandler {
+    return async (c: Context, next: Next) => {
+        const request = getStoredRequest(c);
+        const collectingResponse = getStoredCollectingResponse(c);
 
         try {
             c.req.session = await Session.getSession(request, collectingResponse, {
                 sessionRequired: false,
             });
-
-            await next();
-
-            return mergeCollectingResponseIntoHonoResponse(c.res, collectingResponse);
         } catch (err) {
             if (Session.Error.isErrorFromSuperTokens(err)) {
                 if (err.type === Session.Error.TRY_REFRESH_TOKEN || err.type === Session.Error.INVALID_CLAIMS) {
@@ -131,23 +182,25 @@ export function superTokensMiddleware(): MiddlewareHandler {
                     });
                 }
             }
-
             throw err;
         }
+
+        await next();
+
+        return mergeCollectingResponseIntoHonoResponse(c.res, collectingResponse);
     };
 }
 
-function hasCollectingResponsePayload(collectingResponse: CollectingResponse): boolean {
-    return collectingResponse.body !== undefined || collectingResponse.cookies.length > 0;
-}
-
 /**
- * Hono middleware that verifies the session created by `superTokensMiddleware()`.
+ * Protects a route by verifying the session. Must run after `middleware()`.
+ * Equivalent to `verifySession()` from `supertokens-node/recipe/session/framework/express`.
  */
 export function verifySession(options?: VerifySessionOptions): MiddlewareHandler {
     return async (c: Context, next: Next) => {
         const request = getStoredRequest(c);
         const collectingResponse = getStoredCollectingResponse(c);
+        const statusBefore = collectingResponse.statusCode;
+        const bodyBefore = collectingResponse.body;
 
         const verifyError = await customVerifySession(options)(request, collectingResponse);
 
@@ -155,18 +208,27 @@ export function verifySession(options?: VerifySessionOptions): MiddlewareHandler
             throw verifyError;
         }
 
-        if (hasCollectingResponsePayload(collectingResponse)) {
+        if (collectingResponse.body !== bodyBefore || collectingResponse.statusCode !== statusBefore) {
             return toWebResponse(collectingResponse);
         }
 
         c.req.session = request.session;
-        c.set(ST_REQUEST_KEY, request);
+        storeContext(c, request, collectingResponse);
 
         await next();
 
         return mergeCollectingResponseIntoHonoResponse(c.res, collectingResponse);
     };
 }
+
+/** @deprecated Use `middleware()` — kept for backwards compatibility. */
+export const superTokensMiddleware = middleware;
+
+/** @deprecated Use `wrapHonoRequest()` — kept for backwards compatibility. */
+export const wrapRequest = wrapHonoRequest;
+
+/** @deprecated Use `wrapHonoResponse()` — kept for backwards compatibility. */
+export const wrapResponse = wrapHonoResponse;
 
 declare module "hono" {
     interface HonoRequest {
