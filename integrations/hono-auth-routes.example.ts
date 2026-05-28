@@ -1,36 +1,30 @@
 /**
- * Example: explicit auth route file for Hono.
- * Mirrors a Next.js App Router auth route that exports GET/POST/DELETE/...
+ * Example: mount SuperTokens auth at /auth
  *
- * Mount with: app.route("/auth", authRoutes)
+ *   app.route("/auth", createAuthRoutes(handlers));
  */
 
 import { Hono } from "hono";
-import { createAuthRouteHandlers } from "./hono";
+import type { Context } from "hono";
+import { createAuthRoutes } from "./hono";
 
 // ensureSuperTokensInit();
 
-const authRoutes = new Hono();
-
-const handlers = createAuthRouteHandlers({
-    beforeHandle: async (_c) => {
+const handlers = {
+    beforeHandle: async (_c: Context) => {
         // const rateLimitError = await rateLimitMiddleware(c.req.raw);
         // if (rateLimitError) return rateLimitErrorToResponse(rateLimitError);
     },
-    afterHandle: (_c, res) => {
+    afterHandle: (_c: Context, res: Response) => {
         if (!res.headers.has("Cache-Control")) {
             res.headers.set("Cache-Control", "no-cache, no-store, max-age=0, must-revalidate");
         }
         return res;
     },
-});
+};
 
-// You choose which methods and paths receive SuperTokens auth handling.
-authRoutes.get("/*", handlers.GET);
-authRoutes.post("/*", handlers.POST);
-authRoutes.delete("/*", handlers.DELETE);
-authRoutes.put("/*", handlers.PUT);
-authRoutes.patch("/*", handlers.PATCH);
-authRoutes.head("/*", handlers.HEAD);
+const app = new Hono();
 
-export default authRoutes;
+app.route("/auth", createAuthRoutes(handlers));
+
+export default app;

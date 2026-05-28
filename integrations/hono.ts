@@ -1,22 +1,18 @@
 /**
  * Explicit SuperTokens + Hono integration.
  *
- * Auth endpoints are NOT registered automatically. You mount them yourself,
- * the same way Next.js App Router exports GET/POST/... on an auth route file.
- *
  * Requires: supertokens.init({ framework: "custom", ... })
  *
  * @example
  * ```ts
  * import { Hono } from "hono";
- * import { createAuthRouteHandlers, verifySession } from "./integrations/hono";
+ * import { createAuthRoutes, verifySession, errorHandler } from "./integrations/hono";
  *
  * ensureSuperTokensInit();
  *
- * // --- auth routes (you control the mount path and middleware) ---
- * const auth = new Hono();
+ * const app = new Hono();
  *
- * const handlers = createAuthRouteHandlers({
+ * app.route("/auth", createAuthRoutes({
  *   beforeHandle: async (c) => {
  *     const rateLimitError = await rateLimitMiddleware(c.req.raw);
  *     if (rateLimitError) return rateLimitErrorToResponse(rateLimitError);
@@ -27,18 +23,8 @@
  *     }
  *     return res;
  *   },
- * });
+ * }));
  *
- * auth.get("/*", handlers.GET);
- * auth.post("/*", handlers.POST);
- * auth.delete("/*", handlers.DELETE);
- * auth.put("/*", handlers.PUT);
- * auth.patch("/*", handlers.PATCH);
- * auth.head("/*", handlers.HEAD);
- *
- * app.route("/auth", auth); // only /auth/* hits SuperTokens
- *
- * // --- protected API routes (separate, explicit) ---
  * app.get("/sessioninfo", verifySession(), (c) =>
  *   c.json({ userId: c.req.session!.getUserId() })
  * );
@@ -46,6 +32,7 @@
  * ```
  */
 
+import { Hono } from "hono";
 import type { Context, ErrorHandler, MiddlewareHandler, Next } from "hono";
 import { getCookie } from "hono/cookie";
 import { serialize } from "cookie";
@@ -69,26 +56,10 @@ const ST_RESPONSE_KEY = "supertokens:collectingResponse";
 export type AuthRequestHandler = (request: Request) => Promise<Response>;
 
 export type AuthRouteHandlerOptions = {
-    /**
-     * Runs before SuperTokens handles the request.
-     * Return a Response to short-circuit (e.g. rate limiting).
-     */
+    /** Return a Response to short-circuit (e.g. rate limiting). */
     beforeHandle?: (c: Context) => Promise<Response | undefined | void>;
-    /**
-     * Runs after SuperTokens returns a response.
-     * Use for cache headers, logging, etc.
-     */
+    /** Transform the SuperTokens response (e.g. cache headers). */
     afterHandle?: (c: Context, response: Response) => Response | Promise<Response>;
-};
-
-export type AuthRouteHandlers = {
-    GET: MiddlewareHandler;
-    POST: MiddlewareHandler;
-    PUT: MiddlewareHandler;
-    PATCH: MiddlewareHandler;
-    DELETE: MiddlewareHandler;
-    HEAD: MiddlewareHandler;
-    OPTIONS: MiddlewareHandler;
 };
 
 function setCookiesInHeaders(headers: Headers, cookies: CollectingResponse["cookies"]): void {
@@ -150,36 +121,27 @@ function getStoredCollectingResponse(c: Context): CollectingResponse {
     return c.get(ST_RESPONSE_KEY) ?? new CollectingResponse();
 }
 
-/**
- * Returns a handler for SuperTokens auth/API requests.
- * Equivalent to `getAppDirRequestHandler()` from `supertokens-node/nextjs`.
- *
- * Pass it a standard Web `Request` — in Hono that is `c.req.raw`.
- */
+/** Same as `getAppDirRequestHandler()` from `supertokens-node/nextjs`. */
 export function getAuthRequestHandler(): AuthRequestHandler {
     return handleAuthAPIRequest();
 }
 
-/**
- * Handles a single auth/API request from a Hono context.
- * Use this when you want one explicit route handler function.
- */
 export async function handleAuthRequest(c: Context): Promise<Response> {
     return getAuthRequestHandler()(c.req.raw);
 }
 
 /**
- * Creates explicit HTTP method handlers for a dedicated auth route file.
- * Wire each method to the paths you control — nothing is registered automatically.
- *
- * Equivalent to exporting GET/POST/DELETE/... from a Next.js App Router auth route.
+ * Returns a Hono app that handles all SuperTokens auth/API routes.
+ * Mount it with `app.route("/auth", createAuthRoutes(handlers))`.
  */
-export function createAuthRouteHandlers(options?: AuthRouteHandlerOptions): AuthRouteHandlers {
+export function createAuthRoutes(handlers?: AuthRouteHandlerOptions): Hono {
     const handleCall = getAuthRequestHandler();
 
-    const handler: MiddlewareHandler = async (c) => {
-        if (options?.beforeHandle) {
-            const earlyResponse = await options.beforeHandle(c);
+    const auth = new Hono();
+
+    auth.all("/*", async (c) => {
+        if (handlers?.beforeHandle) {
+            const earlyResponse = await handlers.beforeHandle(c);
             if (earlyResponse !== undefined) {
                 return earlyResponse;
             }
@@ -187,27 +149,16 @@ export function createAuthRouteHandlers(options?: AuthRouteHandlerOptions): Auth
 
         let response = await handleCall(c.req.raw);
 
-        if (options?.afterHandle) {
-            response = await options.afterHandle(c, response);
+        if (handlers?.afterHandle) {
+            response = await handlers.afterHandle(c, response);
         }
 
         return response;
-    };
+    });
 
-    return {
-        GET: handler,
-        POST: handler,
-        PUT: handler,
-        PATCH: handler,
-        DELETE: handler,
-        HEAD: handler,
-        OPTIONS: handler,
-    };
+    return auth;
 }
 
-/**
- * Wraps a Hono context into SuperTokens' custom-framework request type.
- */
 export function wrapHonoRequest(c: Context): PreParsedRequest {
     return new PreParsedRequest({
         method: c.req.method as HTTPMethod,
@@ -224,10 +175,6 @@ export function wrapHonoResponse(): CollectingResponse {
     return new CollectingResponse();
 }
 
-/**
- * Run custom logic with SuperTokens request/response wrappers.
- * Equivalent to `withPreParsedRequestResponse` from `supertokens-node/custom`.
- */
 export async function withPreParsedRequestResponse(
     c: Context,
     handler: (request: PreParsedRequest, response: CollectingResponse) => Promise<Response>
@@ -235,10 +182,6 @@ export async function withPreParsedRequestResponse(
     return customWithPreParsedRequestResponse(c.req.raw, handler);
 }
 
-/**
- * Run a handler with an optional session attached.
- * Equivalent to `withSession` from `supertokens-node/custom`.
- */
 export async function withSession(
     c: Context,
     handler: (error: Error | undefined, session: SessionContainer | undefined) => Promise<Response>,
@@ -248,10 +191,6 @@ export async function withSession(
     return customWithSession(c.req.raw, handler, options, userContext);
 }
 
-/**
- * Protects a route by verifying the session.
- * Register only on routes you choose — not on auth routes.
- */
 export function verifySession(options?: VerifySessionOptions): MiddlewareHandler {
     return async (c: Context, next: Next) => {
         const request = wrapHonoRequest(c);
@@ -279,10 +218,6 @@ export function verifySession(options?: VerifySessionOptions): MiddlewareHandler
     };
 }
 
-/**
- * Global error handler for session-related SuperTokens errors on protected routes.
- * Register with `app.onError(errorHandler())`.
- */
 export function errorHandler(): ErrorHandler {
     const stErrorHandler = supertokensCustomErrorHandler();
 
